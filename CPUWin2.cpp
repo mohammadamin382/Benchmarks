@@ -26,7 +26,7 @@ struct CoreInfo {
     string type;
     int efficiencyClass;
     
-    // Benchmark scores
+    // Benchmark scores (non-atomic for vector compatibility)
     double mathScore;
     double memoryScore;
     double branchScore;
@@ -39,14 +39,52 @@ struct CoreInfo {
     double peakThroughput;
     DWORD_PTR affinityMask;
     
-    // Real-time metrics
-    atomic<double> currentOps{0};
-    atomic<bool> testComplete{false};
+    // Simple flags for thread sync (non-atomic)
+    bool testComplete;
+    
+    // Default constructor
+    CoreInfo() : id(0), logicalCore(0), physicalCore(0), type(""), efficiencyClass(0),
+                 mathScore(0), memoryScore(0), branchScore(0), cacheScore(0), 
+                 mixedScore(0), overallScore(0), avgLatency(0), peakThroughput(0),
+                 affinityMask(0), testComplete(false) {}
+    
+    // Copy constructor
+    CoreInfo(const CoreInfo& other) 
+        : id(other.id), logicalCore(other.logicalCore), physicalCore(other.physicalCore),
+          type(other.type), efficiencyClass(other.efficiencyClass),
+          mathScore(other.mathScore), memoryScore(other.memoryScore),
+          branchScore(other.branchScore), cacheScore(other.cacheScore),
+          mixedScore(other.mixedScore), overallScore(other.overallScore),
+          avgLatency(other.avgLatency), peakThroughput(other.peakThroughput),
+          affinityMask(other.affinityMask), testComplete(other.testComplete) {}
+    
+    // Copy assignment
+    CoreInfo& operator=(const CoreInfo& other) {
+        if (this != &other) {
+            id = other.id;
+            logicalCore = other.logicalCore;
+            physicalCore = other.physicalCore;
+            type = other.type;
+            efficiencyClass = other.efficiencyClass;
+            mathScore = other.mathScore;
+            memoryScore = other.memoryScore;
+            branchScore = other.branchScore;
+            cacheScore = other.cacheScore;
+            mixedScore = other.mixedScore;
+            overallScore = other.overallScore;
+            avgLatency = other.avgLatency;
+            peakThroughput = other.peakThroughput;
+            affinityMask = other.affinityMask;
+            testComplete = other.testComplete;
+        }
+        return *this;
+    }
 };
 
 mutex consoleMutex;
-atomic<int> completedCores{0};
-atomic<bool> allTestsRunning{false};
+mutex progressMutex;
+int completedCores = 0;
+bool allTestsRunning = false;
 
 void SetConsoleColor(int color) {
     SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), color);
@@ -342,21 +380,33 @@ double MixedWorkloadTest(DWORD_PTR affinityMask, int duration_ms) {
 }
 
 void RunComprehensiveBenchmark(CoreInfo& core, int testDuration) {
-    core.mathScore = MathIntensiveTest(core.affinityMask, testDuration);
-    core.memoryScore = MemoryIntensiveTest(core.affinityMask, testDuration);
-    core.branchScore = BranchIntensiveTest(core.affinityMask, testDuration);
-    core.cacheScore = CacheIntensiveTest(core.affinityMask, testDuration);
-    core.mixedScore = MixedWorkloadTest(core.affinityMask, testDuration);
-    
-    // Calculate weighted overall score
-    core.overallScore = (core.mathScore * 0.25 + 
-                         core.memoryScore * 0.2 + 
-                         core.branchScore * 0.2 + 
-                         core.cacheScore * 0.15 + 
-                         core.mixedScore * 0.2);
-    
-    core.testComplete = true;
-    completedCores++;
+    try {
+        core.mathScore = MathIntensiveTest(core.affinityMask, testDuration);
+        core.memoryScore = MemoryIntensiveTest(core.affinityMask, testDuration);
+        core.branchScore = BranchIntensiveTest(core.affinityMask, testDuration);
+        core.cacheScore = CacheIntensiveTest(core.affinityMask, testDuration);
+        core.mixedScore = MixedWorkloadTest(core.affinityMask, testDuration);
+        
+        // Calculate weighted overall score
+        core.overallScore = (core.mathScore * 0.25 + 
+                             core.memoryScore * 0.2 + 
+                             core.branchScore * 0.2 + 
+                             core.cacheScore * 0.15 + 
+                             core.mixedScore * 0.2);
+        
+        core.testComplete = true;
+        
+        {
+            lock_guard<mutex> lock(progressMutex);
+            completedCores++;
+        }
+    } catch (const exception& e) {
+        lock_guard<mutex> lock(consoleMutex);
+        SetConsoleColor(12);
+        cout << "\n  Error on Core #" << core.id << ": " << e.what() << "\n";
+        SetConsoleColor(7);
+        core.testComplete = false;
+    }
 }
 
 void PrintBanner() {
@@ -643,8 +693,13 @@ int main() {
     }
     
     // Monitor progress
-    while (completedCores < (int)cores.size()) {
-        PrintProgressBar(completedCores.load(), cores.size(), "Overall Progress");
+    int currentCompleted = 0;
+    while (currentCompleted < (int)cores.size()) {
+        {
+            lock_guard<mutex> lock(progressMutex);
+            currentCompleted = completedCores;
+        }
+        PrintProgressBar(currentCompleted, cores.size(), "Overall Progress");
         this_thread::sleep_for(chrono::milliseconds(100));
     }
     
